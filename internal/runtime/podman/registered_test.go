@@ -19,7 +19,7 @@ func fakePodman(t *testing.T) string {
 	script := `#!/bin/sh
 printf '%s\n' "$1" >> "$CALLS"
 case "$1" in
-create) if [ "$CREATE_WAIT" = 1 ]; then exec sleep 3; fi; if [ "$HOLD_PIPE" = 1 ]; then sleep 2 & fi; printf '%s\n' "$CREATED_ID"; [ "$CREATE_FAIL" != 1 ] ;;
+create) if [ -n "$SNAPSHOT" ]; then cp "$JOURNAL"/*.json "$SNAPSHOT"; printf '%s\n' "$@" > "$ARGUMENTS"; fi; if [ -n "$BLOCK_REGISTRATION" ]; then mkdir "$BLOCK_REGISTRATION"; fi; if [ -n "$REPLACE_CLAIM" ]; then mv "$REPLACE_CLAIM" "$REPLACE_CLAIM.old"; cp "$REPLACE_CLAIM.old" "$REPLACE_CLAIM"; fi; if [ -n "$SWAP_JOURNAL" ]; then mv "$SWAP_JOURNAL" "$SWAP_JOURNAL.old"; mkdir -m 700 "$SWAP_JOURNAL"; fi; if [ "$CREATE_WAIT" = 1 ]; then exec sleep 3; fi; if [ "$HOLD_PIPE" = 1 ]; then sleep 2 & fi; printf '%s\n' "$CREATED_ID"; [ "$CREATE_FAIL" != 1 ] ;;
 start) if [ "$START_WAIT" = 1 ]; then exec sleep 3; fi; [ "$START_FAIL" != 1 ] ;;
 run) printf 'ordinary-output' ;;
 esac

@@ -32,6 +32,10 @@ type RegisteredResult struct {
 // Errors and command output are intentionally not returned: either can contain
 // sensitive container data.
 func (a *Adapter) RunRegistered(ctx context.Context, opts spec.RunOptions, register func(context.Context, string) error) (RegisteredResult, error) {
+	return a.runRegistered(ctx, opts, "", register)
+}
+
+func (a *Adapter) runRegistered(ctx context.Context, opts spec.RunOptions, marker string, register func(context.Context, string) error) (RegisteredResult, error) {
 	if register == nil || opts.ContainerName == "" {
 		return RegisteredResult{}, errors.New("registration callback and container name required")
 	}
@@ -39,6 +43,9 @@ func (a *Adapter) RunRegistered(ctx context.Context, opts spec.RunOptions, regis
 		return RegisteredResult{}, errors.New("active deadline required")
 	}
 	args := []string{"create", "--name", opts.ContainerName}
+	if marker != "" {
+		args = append(args, "--label", "io.metaclaw.intent="+marker)
+	}
 	args = append(args, policyFlags(opts.Policy, opts.Env, opts.Workdir, opts.User, opts.CPU, opts.Memory)...)
 	args = append(args, opts.Image)
 	args = append(args, opts.Command...)
