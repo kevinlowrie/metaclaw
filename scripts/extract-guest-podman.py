@@ -2,14 +2,16 @@
 """Fixed, offline guest fixture extractor. Never installs or runs package scripts.
 
 Run only as root in the separately attested disposable guest. Archive input is
-read-only seed media at /run/metaclaw-seed/packages; output is a fresh fixed
+read-only seed media at /run/metaclaw-seed/debs; output is a fresh fixed
 /opt/metaclaw-qualification tree. Partial output is retained on failure.
 """
+import ctypes
 import hashlib
 import os
 import stat
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 
 ARCHIVES = {
@@ -35,17 +37,28 @@ FILES = {
  'usr/lib/x86_64-linux-gnu/libyajl.so.2.1.0': (0o644,43392,'c54f554ef49cc941d85d56714930d06f39e44bb8968cecb2ee52503c834df04d'),
 }
 LINKS = {'usr/lib/x86_64-linux-gnu/libsubid.so.5': 'libsubid.so.5.0.0', 'usr/lib/x86_64-linux-gnu/libyajl.so.2': 'libyajl.so.2.1.0'}
-SOURCE = Path('/run/metaclaw-seed/packages')
+SOURCE = Path('/run/metaclaw-seed/debs')
 DEST = Path('/opt/metaclaw-qualification')
+MAX_MEMBERS = 100000
+MAX_MEMBER_SIZE = 128 * 1024 * 1024
+MAX_TOTAL_SIZE = 2 * 1024 * 1024 * 1024
 
 
-def scan(stream, selected, links, sink):
+def scan(stream, selected, links, sink, *, max_members=MAX_MEMBERS, max_member_size=MAX_MEMBER_SIZE, max_total_size=MAX_TOTAL_SIZE):
     """Read complete archive; call sink only for selected regular file bytes."""
     seen = set()
     found = set()
+    total = 0
+    count = 0
     with tarfile.open(fileobj=stream, mode='r|') as archive:
         for member in archive:
+            count += 1
             name = member.name.removeprefix('./').rstrip('/')
+            if count > max_members or len(name.encode()) > 4096 or member.size < 0 or member.size > max_member_size:
+                raise ValueError('tar member limit exceeded')
+            total += member.size
+            if total > max_total_size:
+                raise ValueError('tar total size limit exceeded')
             if not name:
                 continue
             if name.startswith('/') or any(part in ('', '.', '..') for part in name.split('/')) or name in seen:
@@ -77,6 +90,29 @@ def trusted_dir(path):
     return stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not (info.st_mode & 0o022)
 
 
+def safe_archive(info, read_only_mount):
+    return read_only_mount and stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not (info.st_mode & 0o022)
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def publish_no_replace(source, destination):
+    """Atomically publish a completed tree; never replace an existing path."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = libc.renameat2
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
 def main():
     if os.geteuid() != 0 or not all(trusted_dir(p) for p in (Path('/run'), SOURCE.parent, SOURCE, Path('/opt'))):
         raise SystemExit('requires root and trusted fixed guest paths')
@@ -87,23 +123,27 @@ def main():
         for name, expected in ARCHIVES.items():
             fd = os.open(SOURCE / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o222:
+            if not safe_archive(info, bool(os.statvfs(SOURCE).f_flag & os.ST_RDONLY)):
                 raise ValueError('archive must be root-owned and read-only')
             with os.fdopen(os.dup(fd), 'rb') as f:
                 actual = hashlib.file_digest(f, 'sha256').hexdigest()
             if actual != expected:
                 raise ValueError('archive digest mismatch')
             handles.append(fd)
-        DEST.mkdir(mode=0o755)
-        os.chmod(DEST, 0o755)
+        stage = Path(tempfile.mkdtemp(prefix='.metaclaw-qualification-stage-', dir=DEST.parent))
+        os.chmod(stage, 0o700)
+        fsync_dir(DEST.parent)
+        tree = stage / 'tree'
+        tree.mkdir(mode=0o755)
+        os.chmod(tree, 0o755)
         for name in ('usr', 'usr/bin', 'usr/lib', 'usr/lib/podman', 'usr/lib/x86_64-linux-gnu'):
-            (DEST / name).mkdir(mode=0o755)
-            os.chmod(DEST / name, 0o755)
+            (tree / name).mkdir(mode=0o755)
+            os.chmod(tree / name, 0o755)
         found = set()
         def write(name, data, mode):
             if name in found:
                 raise ValueError('selected member repeated across packages')
-            path = DEST / name
+            path = tree / name
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'wb') as out:
                 out.write(data)
@@ -127,7 +167,12 @@ def main():
         if found != set(FILES) | set(LINKS):
             raise ValueError('selected member missing')
         for name, target in LINKS.items():
-            os.symlink(target, DEST / name)
+            os.symlink(target, tree / name)
+        for name in ('usr/bin', 'usr/lib/podman', 'usr/lib/x86_64-linux-gnu', 'usr/lib', 'usr', ''):
+            fsync_dir(tree / name)
+        fsync_dir(stage)
+        publish_no_replace(tree, DEST)
+        fsync_dir(DEST.parent)
         print('prepared fixed guest prefix; no units or package scripts installed')
     finally:
         for fd in handles:
