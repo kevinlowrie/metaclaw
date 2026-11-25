@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -42,14 +43,24 @@ func (a *Adapter) runRegistered(ctx context.Context, opts spec.RunOptions, marke
 	if _, ok := ctx.Deadline(); !ok || ctx.Err() != nil {
 		return RegisteredResult{}, errors.New("active deadline required")
 	}
+	envFile, err := registeredEnvFile(opts.Policy, opts.Env)
+	if err != nil {
+		return RegisteredResult{}, errors.New("container environment unavailable")
+	}
+	if envFile != nil {
+		defer envFile.Close()
+	}
 	args := []string{"create", "--name", opts.ContainerName}
 	if marker != "" {
 		args = append(args, "--label", "io.metaclaw.intent="+marker)
 	}
-	args = append(args, policyFlags(opts.Policy, opts.Env, opts.Workdir, opts.User, opts.CPU, opts.Memory)...)
+	args = append(args, policyFlags(opts.Policy, nil, opts.Workdir, opts.User, opts.CPU, opts.Memory)...)
+	if envFile != nil {
+		args = append(args, "--env-file", "/proc/self/fd/3")
+	}
 	args = append(args, opts.Image)
 	args = append(args, opts.Command...)
-	out, overflow, _, err := registeredCommand(ctx, args, opts.Env, true)
+	out, overflow, _, err := registeredCommand(ctx, args, envFile, true)
 	if err != nil || overflow || !fullContainerID.MatchString(strings.TrimSpace(out)) {
 		return RegisteredResult{CreateUnknown: true}, errors.New("container creation outcome unknown")
 	}
@@ -93,10 +104,15 @@ func (w *limitedOutput) Write(p []byte) (int, error) {
 	}
 	return n, nil
 }
-func registeredCommand(ctx context.Context, args []string, env map[string]string, capture bool) (string, bool, int, error) {
+func registeredCommand(ctx context.Context, args []string, envFile *os.File, capture bool) (string, bool, int, error) {
 	cmd := exec.CommandContext(ctx, "podman", args...)
 	cmd.WaitDelay = 250 * time.Millisecond
-	cmd.Env = mergeEnv(env)
+	// Task variables are provided through an anonymous env file, not the CLI
+	// environment, where they could change Podman's runtime or connection.
+	cmd.Env = os.Environ()
+	if envFile != nil {
+		cmd.ExtraFiles = []*os.File{envFile}
+	}
 	output := &limitedOutput{}
 	if capture {
 		cmd.Stdout = output
