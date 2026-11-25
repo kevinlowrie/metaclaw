@@ -4,8 +4,9 @@ set -eu
 umask 077
 if [ "$#" -ne 3 ]; then echo 'usage: runner REVIEWED_TEST_BINARY SYNTHETIC_ARCHIVE PRIVATE_PARENT' >&2; exit 2; fi
 binary=$1 archive=$2 parent=$3
-# Must be independently rebuilt and reviewed after private-prefix changes.
-binary_sha=UNREVIEWED_BUILD
+# Independently reproduced at 831cd3c, test blob e5e93d6310af856fcc9d126681e3bde2863da205;
+# Go 1.25.7, CGO_ENABLED=0, -trimpath -buildvcs=false.
+binary_sha=7f2d42527f95a92708150752aa523e3d38e3116f6649071895578d29542f3967
 case "$binary:$archive:$parent" in /*:/*:/*) ;; *) exit 2;; esac
 case "$binary_sha" in *[!0-9a-f]*|'') exit 2;; esac
 [ "${#binary_sha}" -eq 64 ] || exit 2
