@@ -19,8 +19,8 @@ def main():
     (output / 'meta-data').write_text('instance-id: metaclaw-no-start-qualification-v1\nlocal-hostname: metaclaw-qualification\n')
     (output / 'network-config').write_text('version: 2\nethernets: {}\n')
     # Existing cloud-init runs the bounded child. A missing serial result or
-    # timeout is UNKNOWN to the external host. Poweroff is guest-gated.
-    command = 'if [ "$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)" = QEMU ] && [ "$(ls -1 /sys/class/net 2>/dev/null)" = lo ]; then /usr/bin/timeout --signal=TERM --kill-after=10s 180s /usr/bin/python3 /run/metaclaw-qualification-bootstrap.py || true; /usr/sbin/poweroff -f; fi'
+    # timeout is UNKNOWN to the external host. Only the host controls shutdown.
+    command = 'if [ "$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)" = QEMU ] && [ "$(ls -1 /sys/class/net 2>/dev/null)" = lo ]; then /usr/bin/timeout --signal=TERM --kill-after=10s 180s /usr/bin/python3 /run/metaclaw-qualification-bootstrap.py || true; fi'
     user = '#cloud-config\nusers: []\npackage_update: false\npackage_upgrade: false\nnetwork: {config: disabled}\nwrite_files:\n  - path: /run/metaclaw-qualification-bootstrap.py\n    owner: root:root\n    permissions: "0700"\n    encoding: b64\n    content: ' + encoded + '\nruncmd:\n  - [ /bin/sh, -c, ' + "'" + command.replace("'", "''") + "'" + ' ]\n'
     (output / 'user-data').write_text(user)
     for name in ('meta-data', 'network-config', 'user-data'):

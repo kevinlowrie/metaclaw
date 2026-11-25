@@ -4,12 +4,12 @@
 Runs through existing cloud-init only. Errors and timeouts never imply cleanup.
 """
 import hashlib
+import array
+import fcntl
 import json
 import os
-import re
 import stat
 import subprocess
-import time
 from pathlib import Path
 
 ISO_SHA = '733f69788dd932bba4995b9eabda65f6d89569f71def4ca991d09c72ed324b39'
@@ -47,14 +47,16 @@ def status_record(stage, success):
         raise ValueError('stage')
     return {'schema': 'metaclaw.no-start-qualification.v1', 'stage': stage,
             'result': 'passed' if success else 'unknown',
-            'cleanup': 'confirmed' if success else 'unknown',
+            'exact_container_absence': 'confirmed' if success else 'unknown',
+            'broader_cleanup': 'unknown',
             'data_iso_sha256': ISO_SHA, 'test_sha256': FILES['guest.test'],
             'oci_sha256': FILES['synthetic.oci.tar']}
 
 
-def run(*args, timeout=20):
+def run(*args, timeout=20, pass_fds=()):
     subprocess.run(args, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}, timeout=timeout)
+                   stderr=subprocess.DEVNULL, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}, timeout=timeout,
+                   pass_fds=pass_fds)
 
 
 def digest(path):
@@ -62,25 +64,56 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def digest_fd(fd):
+    os.lseek(fd, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(fd), 'rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def check_mountinfo(text, major_minor, flags):
+    required = os.ST_RDONLY | os.ST_NOSUID | os.ST_NODEV | os.ST_NOEXEC
+    if flags & required != required:
+        raise ValueError('media mount flags')
+    matches = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 10 or '-' not in fields:
+            raise ValueError('malformed mountinfo')
+        if fields[4] == '/run/metaclaw-seed':
+            sep = fields.index('-')
+            if sep + 2 >= len(fields):
+                raise ValueError('malformed mountinfo source')
+            matches.append((fields[2], fields[3], fields[sep + 1]))
+    if matches != [(major_minor, '/', 'iso9660')]:
+        raise ValueError('media mount identity')
+
+
 def main():
     stage, success = 'preflight', False
+    device_fd = None
     try:
         if os.geteuid() != 0 or Path('/sys/class/dmi/id/sys_vendor').read_text().strip() != 'QEMU':
             raise ValueError('guest identity')
         check_network(sorted(os.listdir('/sys/class/net')), Path('/proc/net/route').read_text(), Path('/proc/net/ipv6_route').read_text())
         stage = 'media'
         device = Path('/dev/disk/by-label/METACLAW_DATA')
-        info = device.stat()
+        device_fd = os.open(device, os.O_RDONLY | os.O_CLOEXEC)
+        info = os.fstat(device_fd)
         if not stat.S_ISBLK(info.st_mode):
             raise ValueError('media type')
-        size = subprocess.run(['/usr/sbin/blockdev', '--getsize64', str(device)], check=True, capture_output=True, text=True, timeout=10).stdout.strip()
-        if size != str(ISO_SIZE) or digest(device) != ISO_SHA:
+        size = array.array('Q', [0])
+        fcntl.ioctl(device_fd, 0x80081272, size, True)  # BLKGETSIZE64
+        if size[0] != ISO_SIZE or digest_fd(device_fd) != ISO_SHA:
             raise ValueError('media digest')
         mount = Path('/run/metaclaw-seed')
         mount.mkdir(mode=0o700)
-        run('/usr/bin/mount', '-t', 'iso9660', '-o', 'ro,nosuid,nodev,noexec', str(device), str(mount))
-        if not (os.statvfs(mount).f_flag & os.ST_RDONLY):
-            raise ValueError('media not read-only')
+        run('/usr/bin/mount', '-t', 'iso9660', '-o', 'ro,nosuid,nodev,noexec', '/proc/self/fd/' + str(device_fd), str(mount), pass_fds=(device_fd,))
+        expected_device = f'{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}'
+        check_mountinfo(Path('/proc/self/mountinfo').read_text(), expected_device, os.statvfs(mount).f_flag)
+        after = os.fstat(device_fd)
+        label = device.stat()
+        if (after.st_dev, after.st_ino, after.st_rdev) != (info.st_dev, info.st_ino, info.st_rdev) or (label.st_dev, label.st_ino, label.st_rdev) != (info.st_dev, info.st_ino, info.st_rdev) or os.stat(mount).st_dev != info.st_rdev or digest_fd(device_fd) != ISO_SHA:
+            raise ValueError('media identity changed')
         if set(os.listdir(mount)) != set(FILES) | {'debs', 'manifest.json'}:
             raise ValueError('media layout')
         for name, expected in FILES.items():
@@ -124,6 +157,9 @@ def main():
         stage, success = 'complete', True
     except BaseException:
         pass
+    finally:
+        if device_fd is not None:
+            os.close(device_fd)
     message = ('METACLAW_QUAL_V1 ' + json.dumps(status_record(stage, success), sort_keys=True, separators=(',', ':')) + '\n').encode()
     if len(message) <= 512:
         try:
