@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/fpp-125/metaclaw/internal/runtime/spec"
 )
@@ -113,6 +114,35 @@ func TestIntentOwnerRefusalDoesNotStart(t *testing.T) {
 	result, err := New().RunWithIntent(testContext(t), spec.RunOptions{Image: "fixture"}, journal, intentBinding(), func(context.Context, IntentRecord) error { return errors.New("owner unavailable") })
 	if err == nil || result.ContainerID != strings.Repeat("a", 64) || calls(t, log) != "create\n" {
 		t.Fatalf("result=%+v err=%v calls=%q", result, err, calls(t, log))
+	}
+}
+
+func TestIntentOwnerDeadlinePreservesClaimAndRegistration(t *testing.T) {
+	log := fakePodman(t)
+	journal := privateJournal(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	release := make(chan struct{})
+	ownerFinished := make(chan struct{})
+	result, err := New().RunWithIntent(ctx, spec.RunOptions{Image: "fixture"}, journal, intentBinding(), func(context.Context, IntentRecord) error {
+		<-release
+		close(ownerFinished)
+		return nil
+	})
+	if err == nil || !result.RegistrationUnknown || result.ContainerID != strings.Repeat("a", 64) {
+		close(release)
+		t.Fatalf("expected known ID and unconfirmed registration: %+v %v", result, err)
+	}
+	close(release)
+	<-ownerFinished
+	for _, suffix := range []string{".json", ".registration.json"} {
+		if _, statErr := os.Stat(filepath.Join(journal, intentBinding().OperationDigest+suffix)); statErr != nil {
+			t.Fatalf("durable record %s unavailable: %v", suffix, statErr)
+		}
+	}
+	_, err = New().RunWithIntent(testContext(t), spec.RunOptions{Image: "fixture"}, journal, intentBinding(), func(context.Context, IntentRecord) error { return nil })
+	if err == nil || calls(t, log) != "create\n" {
+		t.Fatalf("uncertain operation retried or started: err=%v calls=%q", err, calls(t, log))
 	}
 }
 func TestIntentRegistrationPersistenceFailureDoesNotAckOrStart(t *testing.T) {

@@ -18,17 +18,19 @@ var fullContainerID = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // RegisteredResult describes only what this adapter observed. Unknown outcomes
 // require reconciliation by the caller's independent owner before any retry.
 type RegisteredResult struct {
-	ContainerID   string
-	CreateUnknown bool
-	StartUnknown  bool
-	ExitCode      int
+	ContainerID         string
+	CreateUnknown       bool
+	RegistrationUnknown bool
+	StartUnknown        bool
+	ExitCode            int
 }
 
 // RunRegistered is a preparatory adapter seam, not an ownership service. The
 // callback must persist the exact ID and establish an independent owner before
-// acknowledging. The callback must honor its context and return promptly; a
-// blocked callback is not interrupted here. The caller is responsible for crash
-// recovery and cleanup. A create can have host-side effects such as image pulls
+// acknowledging. A callback must honor its context and return promptly. If it
+// does not, the call returns at its deadline with registration unknown; the
+// callback may still be running, so the independent owner must reconcile it.
+// The caller is responsible for crash recovery and cleanup. A create can have host-side effects such as image pulls
 // and hooks, even before the container is started.
 // Errors and command output are intentionally not returned: either can contain
 // sensitive container data.
@@ -66,7 +68,17 @@ func (a *Adapter) runRegistered(ctx context.Context, opts spec.RunOptions, marke
 	}
 	id := strings.TrimSpace(out)
 	result := RegisteredResult{ContainerID: id}
-	if register(ctx, id) != nil || ctx.Err() != nil {
+	registration := make(chan error, 1)
+	go func() { registration <- register(ctx, id) }()
+	select {
+	case err := <-registration:
+		if err == nil && ctx.Err() == nil {
+			break
+		}
+		result.RegistrationUnknown = true
+		return result, errors.New("container registration not acknowledged")
+	case <-ctx.Done():
+		result.RegistrationUnknown = true
 		return result, errors.New("container registration not acknowledged")
 	}
 	args = []string{"start"}

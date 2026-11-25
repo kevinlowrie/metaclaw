@@ -169,3 +169,40 @@ func TestRegisteredRunDoesNotStartAfterRegistrationDeadline(t *testing.T) {
 		t.Fatalf("result=%+v err=%v calls=%q", result, err, calls(t, log))
 	}
 }
+
+func TestRegisteredRunReturnsWhenOwnerIgnoresDeadline(t *testing.T) {
+	log := fakePodman(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	release := make(chan struct{})
+	type outcome struct {
+		result RegisteredResult
+		err    error
+	}
+	finished := make(chan outcome, 1)
+	ownerFinished := make(chan struct{})
+	go func() {
+		result, err := New().RunRegistered(ctx, spec.RunOptions{ContainerName: "test", Image: "image"}, func(context.Context, string) error {
+			<-release
+			close(ownerFinished)
+			return nil
+		})
+		finished <- outcome{result, err}
+	}()
+	select {
+	case got := <-finished:
+		if got.err == nil || !got.result.RegistrationUnknown || got.result.ContainerID != strings.Repeat("a", 64) {
+			close(release)
+			t.Fatalf("expected known ID and unacknowledged error, got result=%+v err=%v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-finished
+		t.Fatal("run remained blocked after owner deadline")
+	}
+	close(release)
+	<-ownerFinished
+	if got := calls(t, log); got != "create\n" {
+		t.Fatalf("unexpected podman calls: %q", got)
+	}
+}

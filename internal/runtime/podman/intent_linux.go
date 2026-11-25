@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/fpp-125/metaclaw/internal/runtime/spec"
 	"golang.org/x/sys/unix"
@@ -144,7 +145,12 @@ func (a *Adapter) RunWithIntent(ctx context.Context, opts spec.RunOptions, dir s
 	if err != nil {
 		return RegisteredResult{}, errors.New("intent journal unavailable")
 	}
-	defer d.Close()
+	var journalLock sync.Mutex
+	defer func() {
+		journalLock.Lock()
+		defer journalLock.Unlock()
+		d.Close()
+	}()
 	var b [16]byte
 	if _, err = rand.Read(b[:]); err != nil {
 		return RegisteredResult{}, errors.New("intent marker unavailable")
@@ -165,25 +171,35 @@ func (a *Adapter) RunWithIntent(ctx context.Context, opts spec.RunOptions, dir s
 	}
 	opts.ContainerName = rec.ContainerName
 	return a.runRegistered(ctx, opts, marker, func(ctx context.Context, id string) error {
-		if !sameJournal(dir, d) || !sameClaim(d, name, claim) {
-			return errors.New("intent identity changed")
-		}
-		rec.ContainerID = id
-		raw, err := json.Marshal(rec)
-		if err != nil {
-			return errors.New("registration encoding failed")
-		}
+		var registration os.FileInfo
 		registrationName := binding.OperationDigest + ".registration.json"
-		registration, err := createRecord(d, registrationName, raw)
-		if err != nil {
-			return errors.New("registration persistence failed")
-		}
-		if !sameJournal(dir, d) || !sameClaim(d, name, claim) || !sameClaim(d, registrationName, registration) {
-			return errors.New("intent identity changed")
+		if err := func() error {
+			journalLock.Lock()
+			defer journalLock.Unlock()
+			if !sameJournal(dir, d) || !sameClaim(d, name, claim) {
+				return errors.New("intent identity changed")
+			}
+			rec.ContainerID = id
+			raw, err := json.Marshal(rec)
+			if err != nil {
+				return errors.New("registration encoding failed")
+			}
+			registration, err = createRecord(d, registrationName, raw)
+			if err != nil {
+				return errors.New("registration persistence failed")
+			}
+			if !sameJournal(dir, d) || !sameClaim(d, name, claim) || !sameClaim(d, registrationName, registration) {
+				return errors.New("intent identity changed")
+			}
+			return nil
+		}(); err != nil {
+			return err
 		}
 		if err := ownerAck(ctx, rec); err != nil {
 			return err
 		}
+		journalLock.Lock()
+		defer journalLock.Unlock()
 		if !sameJournal(dir, d) || !sameClaim(d, name, claim) || !sameClaim(d, registrationName, registration) {
 			return errors.New("intent identity changed")
 		}
