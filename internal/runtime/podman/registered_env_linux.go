@@ -15,9 +15,38 @@ import (
 
 var envFileKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// Keep a line well below Podman's scanner limit, including its delimiter.
+// Validate before a durable intent is claimed as well as before writing.
+func validateRegisteredEnv(p policy.Policy, env map[string]string) error {
+	allowed := make(map[string]bool, len(p.EnvAllowlist))
+	for _, key := range p.EnvAllowlist {
+		allowed[key] = true
+	}
+	total := 0
+	for key, value := range env {
+		if !allowed[key] {
+			continue
+		}
+		if !envFileKey.MatchString(key) || strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("unrepresentable container environment")
+		}
+		if len(key)+1 > 60*1024 || len(value) > 60*1024-len(key)-1 {
+			return fmt.Errorf("container environment line too large")
+		}
+		total += len(key) + len(value) + 2
+		if total > 1<<20 {
+			return fmt.Errorf("container environment too large")
+		}
+	}
+	return nil
+}
+
 // registeredEnvFile is anonymous and never places task values in the Podman
 // process environment or argv. Unsupported env-file values fail before create.
 func registeredEnvFile(p policy.Policy, env map[string]string) (*os.File, error) {
+	if err := validateRegisteredEnv(p, env); err != nil {
+		return nil, err
+	}
 	allowed := make(map[string]bool, len(p.EnvAllowlist))
 	for _, key := range p.EnvAllowlist {
 		allowed[key] = true
@@ -35,12 +64,6 @@ func registeredEnvFile(p policy.Policy, env map[string]string) (*os.File, error)
 	var data strings.Builder
 	for _, key := range keys {
 		value := env[key]
-		if !envFileKey.MatchString(key) || strings.ContainsAny(value, "\r\n\x00") {
-			return nil, fmt.Errorf("unrepresentable container environment")
-		}
-		if data.Len()+len(key)+len(value)+2 > 1<<20 {
-			return nil, fmt.Errorf("container environment too large")
-		}
 		data.WriteString(key)
 		data.WriteByte('=')
 		data.WriteString(value)

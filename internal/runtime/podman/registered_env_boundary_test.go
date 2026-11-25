@@ -3,6 +3,7 @@
 package podman
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -78,5 +79,33 @@ func TestRegisteredCreateRejectsUnrepresentableEnvironmentBeforeCreate(t *testin
 	}, func(context.Context, string) error { return nil })
 	if err == nil || calls(t, log) != "" {
 		t.Fatalf("err=%v calls=%q", err, calls(t, log))
+	}
+}
+
+func TestIntentRejectsOversizedEnvLineBeforeJournalClaim(t *testing.T) {
+	log := fakePodman(t)
+	journal := privateJournal(t)
+	_, err := New().RunWithIntent(testContext(t), spec.RunOptions{
+		Image: "fixture", Policy: policy.Policy{EnvAllowlist: []string{"A"}},
+		Env: map[string]string{"A": strings.Repeat("x", 60*1024)},
+	}, journal, intentBinding(), func(context.Context, IntentRecord) error { return nil })
+	if err == nil || calls(t, log) != "" {
+		t.Fatalf("err=%v calls=%q", err, calls(t, log))
+	}
+	entries, err := os.ReadDir(journal)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("journal unexpectedly claimed: %d, %v", len(entries), err)
+	}
+}
+
+func TestRegisteredEnvFileAcceptsConservativeMaxLine(t *testing.T) {
+	file, err := registeredEnvFile(policy.Policy{EnvAllowlist: []string{"A"}}, map[string]string{"A": strings.Repeat("x", 60*1024-2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() || len(scanner.Text()) != 60*1024 || scanner.Err() != nil {
+		t.Fatalf("max line not accepted by default scanner: %v", scanner.Err())
 	}
 }

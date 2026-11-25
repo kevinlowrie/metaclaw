@@ -137,6 +137,9 @@ func (a *Adapter) RunWithIntent(ctx context.Context, opts spec.RunOptions, dir s
 	if _, ok := ctx.Deadline(); !ok || ctx.Err() != nil {
 		return RegisteredResult{}, errors.New("active deadline required")
 	}
+	if validateRegisteredEnv(opts.Policy, opts.Env) != nil {
+		return RegisteredResult{}, errors.New("container environment unavailable")
+	}
 	d, err := openJournal(dir)
 	if err != nil {
 		return RegisteredResult{}, errors.New("intent journal unavailable")
