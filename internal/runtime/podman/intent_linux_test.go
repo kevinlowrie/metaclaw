@@ -84,6 +84,26 @@ func TestIntentUnknownCreateAndConflictNeverRetry(t *testing.T) {
 		t.Fatalf("unexpected calls %q", calls(t, log))
 	}
 }
+
+func TestIntentUnknownCreateReleasesJournalDescriptors(t *testing.T) {
+	fakePodman(t)
+	t.Setenv("CREATE_FAIL", "1")
+	journal := privateJournal(t)
+	result, err := New().RunWithIntent(testContext(t), spec.RunOptions{Image: "fixture"}, journal, intentBinding(), func(context.Context, IntentRecord) error { return nil })
+	if err == nil || !result.CreateUnknown {
+		t.Fatalf("expected unknown create: %+v %v", result, err)
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		target, readErr := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if readErr == nil && target == journal {
+			t.Fatal("journal descriptor retained after failed create")
+		}
+	}
+}
 func TestIntentConcurrentClaimsOnlyOneCreate(t *testing.T) {
 	log := fakePodman(t)
 	journal := privateJournal(t)
@@ -143,6 +163,78 @@ func TestIntentOwnerDeadlinePreservesClaimAndRegistration(t *testing.T) {
 	_, err = New().RunWithIntent(testContext(t), spec.RunOptions{Image: "fixture"}, journal, intentBinding(), func(context.Context, IntentRecord) error { return nil })
 	if err == nil || calls(t, log) != "create\n" {
 		t.Fatalf("uncertain operation retried or started: err=%v calls=%q", err, calls(t, log))
+	}
+}
+
+func TestIntentDeadlineDoesNotWaitForStalledRegistrationPersistence(t *testing.T) {
+	log := fakePodman(t)
+	journal := privateJournal(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	finishedPersistence := make(chan struct{})
+	registrationDone := make(chan struct{})
+	ownerCalled := make(chan struct{}, 1)
+	type outcome struct {
+		result RegisteredResult
+		err    error
+	}
+	finished := make(chan outcome, 1)
+	go func() {
+		result, err := New().runWithIntent(ctx, spec.RunOptions{Image: "fixture"}, journal, intentBinding(), func(context.Context, IntentRecord) error {
+			ownerCalled <- struct{}{}
+			return nil
+		}, func(dir *os.File, name string, data []byte) (os.FileInfo, error) {
+			close(entered)
+			<-release
+			defer close(finishedPersistence)
+			return createRecord(dir, name, data)
+		}, func() { close(registrationDone) })
+		finished <- outcome{result, err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(release)
+		<-finished
+		t.Fatal("registration persistence not reached")
+	}
+	select {
+	case got := <-finished:
+		if got.err == nil || !got.result.RegistrationUnknown || got.result.ContainerID != strings.Repeat("a", 64) {
+			close(release)
+			<-finishedPersistence
+			t.Fatalf("expected known container and unknown registration: %+v %v", got.result, got.err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-finished
+		<-finishedPersistence
+		t.Fatal("run waited for stalled registration after deadline")
+	}
+	close(release)
+	<-finishedPersistence
+	<-registrationDone
+	select {
+	case <-ownerCalled:
+		t.Fatal("owner acknowledgement began after deadline")
+	default:
+	}
+	raw, err := os.ReadFile(filepath.Join(journal, intentBinding().OperationDigest+".registration.json"))
+	if err != nil {
+		t.Fatalf("late registration record unavailable: %v", err)
+	}
+	var record IntentRecord
+	if err = json.Unmarshal(raw, &record); err != nil || record.ContainerID != strings.Repeat("a", 64) {
+		t.Fatalf("late registration record lacks exact ID: %+v %v", record, err)
+	}
+	_, err = New().RunWithIntent(testContext(t), spec.RunOptions{Image: "fixture"}, journal, intentBinding(), func(context.Context, IntentRecord) error { return nil })
+	if err == nil {
+		t.Fatal("uncertain create was retried")
+	}
+	if got := calls(t, log); got != "create\n" {
+		t.Fatalf("container started after uncertainty: %q", got)
 	}
 }
 func TestIntentRegistrationPersistenceFailureDoesNotAckOrStart(t *testing.T) {

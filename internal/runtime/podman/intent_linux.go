@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/fpp-125/metaclaw/internal/runtime/spec"
 	"golang.org/x/sys/unix"
@@ -132,6 +131,10 @@ func sameClaim(d *os.File, name string, original os.FileInfo) bool {
 // independent owner or recovery. The owner callback must independently establish
 // custody. Unknown outcomes and existing claims are never automatically retried.
 func (a *Adapter) RunWithIntent(ctx context.Context, opts spec.RunOptions, dir string, binding IntentBinding, ownerAck func(context.Context, IntentRecord) error) (RegisteredResult, error) {
+	return a.runWithIntent(ctx, opts, dir, binding, ownerAck, createRecord, nil)
+}
+
+func (a *Adapter) runWithIntent(ctx context.Context, opts spec.RunOptions, dir string, binding IntentBinding, ownerAck func(context.Context, IntentRecord) error, persistRegistration func(*os.File, string, []byte) (os.FileInfo, error), onRegistrationDone func()) (RegisteredResult, error) {
 	if ownerAck == nil || !fullContainerID.MatchString(binding.OperationDigest) || !fullContainerID.MatchString(binding.RunDigest) || binding.Generation == 0 || opts.ContainerName != "" {
 		return RegisteredResult{}, errors.New("invalid intent input")
 	}
@@ -145,11 +148,17 @@ func (a *Adapter) RunWithIntent(ctx context.Context, opts spec.RunOptions, dir s
 	if err != nil {
 		return RegisteredResult{}, errors.New("intent journal unavailable")
 	}
-	var journalLock sync.Mutex
+	defer d.Close()
+	registrationFD, err := unix.FcntlInt(d.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return RegisteredResult{}, errors.New("intent journal unavailable")
+	}
+	registrationDir := os.NewFile(uintptr(registrationFD), "registration journal")
+	transferred := false
 	defer func() {
-		journalLock.Lock()
-		defer journalLock.Unlock()
-		d.Close()
+		if !transferred {
+			registrationDir.Close()
+		}
 	}()
 	var b [16]byte
 	if _, err = rand.Read(b[:]); err != nil {
@@ -170,13 +179,18 @@ func (a *Adapter) RunWithIntent(ctx context.Context, opts spec.RunOptions, dir s
 		return RegisteredResult{}, errors.New("intent identity changed")
 	}
 	opts.ContainerName = rec.ContainerName
-	return a.runRegistered(ctx, opts, marker, func(ctx context.Context, id string) error {
+	result, runErr := a.runRegistered(ctx, opts, marker, func(ctx context.Context, id string) error {
+		defer registrationDir.Close()
+		if onRegistrationDone != nil {
+			defer onRegistrationDone()
+		}
+		if ctx.Err() != nil {
+			return errors.New("registration expired")
+		}
 		var registration os.FileInfo
 		registrationName := binding.OperationDigest + ".registration.json"
 		if err := func() error {
-			journalLock.Lock()
-			defer journalLock.Unlock()
-			if !sameJournal(dir, d) || !sameClaim(d, name, claim) {
+			if !sameJournal(dir, registrationDir) || !sameClaim(registrationDir, name, claim) {
 				return errors.New("intent identity changed")
 			}
 			rec.ContainerID = id
@@ -184,25 +198,30 @@ func (a *Adapter) RunWithIntent(ctx context.Context, opts spec.RunOptions, dir s
 			if err != nil {
 				return errors.New("registration encoding failed")
 			}
-			registration, err = createRecord(d, registrationName, raw)
+			registration, err = persistRegistration(registrationDir, registrationName, raw)
 			if err != nil {
 				return errors.New("registration persistence failed")
 			}
-			if !sameJournal(dir, d) || !sameClaim(d, name, claim) || !sameClaim(d, registrationName, registration) {
+			if !sameJournal(dir, registrationDir) || !sameClaim(registrationDir, name, claim) || !sameClaim(registrationDir, registrationName, registration) {
 				return errors.New("intent identity changed")
 			}
 			return nil
 		}(); err != nil {
 			return err
 		}
+		if ctx.Err() != nil {
+			return errors.New("registration expired")
+		}
 		if err := ownerAck(ctx, rec); err != nil {
 			return err
 		}
-		journalLock.Lock()
-		defer journalLock.Unlock()
-		if !sameJournal(dir, d) || !sameClaim(d, name, claim) || !sameClaim(d, registrationName, registration) {
+		if !sameJournal(dir, registrationDir) || !sameClaim(registrationDir, name, claim) || !sameClaim(registrationDir, registrationName, registration) {
 			return errors.New("intent identity changed")
 		}
 		return nil
 	})
+	// A valid create ID means runRegistered started the callback and transferred
+	// this descriptor to it. A failed/unknown create never starts the callback.
+	transferred = result.ContainerID != ""
+	return result, runErr
 }
