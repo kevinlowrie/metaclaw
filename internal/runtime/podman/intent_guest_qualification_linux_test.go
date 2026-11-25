@@ -4,8 +4,11 @@ package podman
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,7 +22,77 @@ import (
 	"github.com/fpp-125/metaclaw/internal/runtime/spec"
 )
 
+const guestPrefix = "/opt/metaclaw-qualification"
+
 const guestImage = "sha256:9779a4143ae4607c8702ee40a94ae02c0c7b759c567588b4ef95a07d3208e005"
+
+func verifyGuestPrefix() error {
+	opt, err := os.Lstat("/opt")
+	if err != nil || !opt.IsDir() || opt.Mode().Perm()&0022 != 0 {
+		return errors.New("guest prefix parent invalid")
+	}
+	optStat, ok := opt.Sys().(*syscall.Stat_t)
+	if !ok || optStat.Uid != 0 {
+		return errors.New("guest prefix parent owner invalid")
+	}
+	for _, name := range []string{"", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/podman", "/usr/lib/x86_64-linux-gnu"} {
+		info, err := os.Lstat(guestPrefix + name)
+		if err != nil || !info.IsDir() || info.Mode().Perm() != 0755 {
+			return errors.New("guest prefix directory invalid")
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || st.Uid != 0 || st.Gid != 0 {
+			return errors.New("guest prefix owner invalid")
+		}
+	}
+	files := map[string]struct {
+		mode os.FileMode
+		sha  string
+	}{
+		"/usr/bin/podman":                             {0755, "6627da0abfd3b0189498089319f5759c7b132bb6a51130bf8ff43d7f102d9673"},
+		"/usr/bin/conmon":                             {0755, "856d10b5842ae5dd7f4cf73a60d0f1a764bdcd0cfadc447adb0b0ef41a935412"},
+		"/usr/bin/crun":                               {0755, "0e6d2727a3bcb013652543f6c8124a24cdea863ee0a99038c55b3591c0d8c126"},
+		"/usr/bin/newuidmap":                          {os.ModeSetuid | 0755, "fd13a73987411f71b8b135cf55ffa00db048754f8d1faf507b6b4aa6204d0ddc"},
+		"/usr/bin/newgidmap":                          {os.ModeSetuid | 0755, "745ce9348600b27fa3007f7df7c115d6e586cef163e89caa44cac4e2f9c8d52c"},
+		"/usr/lib/podman/netavark":                    {0755, "53fc9fe0ff1d80159713d76ec609984ce38ed390cc1729847aa55f4e6a8e9e2f"},
+		"/usr/lib/x86_64-linux-gnu/libsubid.so.5.0.0": {0644, "4973ce6852e811cb632533450e2f2748340d0752f4bc93d63eda8cde1cb60b4a"},
+		"/usr/lib/x86_64-linux-gnu/libyajl.so.2.1.0":  {0644, "c54f554ef49cc941d85d56714930d06f39e44bb8968cecb2ee52503c834df04d"},
+	}
+	for path, expected := range files {
+		file, err := os.Open(guestPrefix + path)
+		if err != nil {
+			return errors.New("guest binary unavailable")
+		}
+		info, err := file.Stat()
+		if err != nil {
+			file.Close()
+			return errors.New("guest binary stat failed")
+		}
+		linkInfo, err := os.Lstat(guestPrefix + path)
+		if err != nil || !linkInfo.Mode().IsRegular() || !os.SameFile(info, linkInfo) || info.Mode() != expected.mode {
+			file.Close()
+			return errors.New("guest binary mode invalid")
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || st.Uid != 0 || st.Gid != 0 {
+			file.Close()
+			return errors.New("guest binary ownership invalid")
+		}
+		h := sha256.New()
+		_, err = io.Copy(h, file)
+		file.Close()
+		if err != nil || fmt.Sprintf("%x", h.Sum(nil)) != expected.sha {
+			return errors.New("guest binary digest mismatch")
+		}
+	}
+	for path, target := range map[string]string{"/usr/lib/x86_64-linux-gnu/libsubid.so.5": "libsubid.so.5.0.0", "/usr/lib/x86_64-linux-gnu/libyajl.so.2": "libyajl.so.2.1.0"} {
+		value, err := os.Readlink(guestPrefix + path)
+		if err != nil || value != target {
+			return errors.New("guest library symlink invalid")
+		}
+	}
+	return nil
+}
 
 func normalizedGuestImageID(value string) (string, bool) {
 	value = strings.TrimPrefix(value, "sha256:")
@@ -62,7 +135,10 @@ func guestCredentials() error {
 // Guest-visible checks cannot attest the host's QEMU configuration, network
 // attachments or storage isolation. Those require independent host evidence.
 func guestPreflight() error {
-	allow := map[string]bool{"PATH": true, "HOME": true, "XDG_RUNTIME_DIR": true, "XDG_CONFIG_HOME": true, "TMPDIR": true, "CONTAINERS_CONF": true, "CONTAINERS_STORAGE_CONF": true, "QUAL_BASE": true, "QUAL_IMAGE": true, "QUAL_UID": true}
+	if err := verifyGuestPrefix(); err != nil {
+		return err
+	}
+	allow := map[string]bool{"PATH": true, "HOME": true, "XDG_RUNTIME_DIR": true, "XDG_CONFIG_HOME": true, "TMPDIR": true, "CONTAINERS_CONF": true, "CONTAINERS_STORAGE_CONF": true, "QUAL_BASE": true, "QUAL_IMAGE": true, "QUAL_UID": true, "LD_LIBRARY_PATH": true}
 	for _, v := range os.Environ() {
 		name, _, ok := strings.Cut(v, "=")
 		if !ok || !allow[name] {
@@ -89,7 +165,7 @@ func guestPreflight() error {
 			return errors.New("private directory owner invalid")
 		}
 	}
-	if os.Getenv("HOME") != filepath.Join(base, "home") || os.Getenv("XDG_RUNTIME_DIR") != filepath.Join(base, "runtime") || os.Getenv("XDG_CONFIG_HOME") != filepath.Join(base, "config") || os.Getenv("TMPDIR") != filepath.Join(base, "tmp") || os.Getenv("PATH") != filepath.Join(base, "bin")+":/usr/bin:/bin" || os.Getenv("CONTAINERS_CONF") != filepath.Join(base, "config/containers.conf") || os.Getenv("CONTAINERS_STORAGE_CONF") != filepath.Join(base, "config/storage.conf") {
+	if os.Getenv("HOME") != filepath.Join(base, "home") || os.Getenv("XDG_RUNTIME_DIR") != filepath.Join(base, "runtime") || os.Getenv("XDG_CONFIG_HOME") != filepath.Join(base, "config") || os.Getenv("TMPDIR") != filepath.Join(base, "tmp") || os.Getenv("PATH") != filepath.Join(base, "bin")+":"+guestPrefix+"/usr/bin:/usr/bin:/bin" || os.Getenv("LD_LIBRARY_PATH") != guestPrefix+"/usr/lib/x86_64-linux-gnu" || os.Getenv("CONTAINERS_CONF") != filepath.Join(base, "config/containers.conf") || os.Getenv("CONTAINERS_STORAGE_CONF") != filepath.Join(base, "config/storage.conf") {
 		return errors.New("environment paths invalid")
 	}
 	for name, expected := range map[string]string{"containers.conf": "[containers]\nvolumes = []\n[engine]\nhooks_dir = []\n", "storage.conf": "[storage]\ndriver = \"vfs\"\n"} {
@@ -177,11 +253,11 @@ func TestGuestIntentRefusesOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := os.Getenv("QUAL_BASE")
-	args := []string{"--root", filepath.Join(base, "root"), "--runroot", filepath.Join(base, "runroot"), "--tmpdir", filepath.Join(base, "tmp"), "--storage-driver", "vfs", "--events-backend", "none", "--hooks-dir", filepath.Join(base, "hooks")}
+	args := []string{"--conmon", guestPrefix + "/usr/bin/conmon", "--runtime", guestPrefix + "/usr/bin/crun", "--root", filepath.Join(base, "root"), "--runroot", filepath.Join(base, "runroot"), "--tmpdir", filepath.Join(base, "tmp"), "--storage-driver", "vfs", "--events-backend", "none", "--hooks-dir", filepath.Join(base, "hooks")}
 	run := func(more ...string) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		return exec.CommandContext(ctx, "/usr/bin/podman", append(append([]string{}, args...), more...)...).Output()
+		return exec.CommandContext(ctx, guestPrefix+"/usr/bin/podman", append(append([]string{}, args...), more...)...).Output()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

@@ -4,9 +4,8 @@ set -eu
 umask 077
 if [ "$#" -ne 3 ]; then echo 'usage: runner REVIEWED_TEST_BINARY SYNTHETIC_ARCHIVE PRIVATE_PARENT' >&2; exit 2; fi
 binary=$1 archive=$2 parent=$3
-# Independently reproduced: base 7d54ca5, test blob 4cbd336978e77a6cb38a44b44ffb26812c97dbd3,
-# Go 1.25.7, CGO_ENABLED=0, -trimpath -buildvcs=false.
-binary_sha=36eccede1ae0b4792a7b673fdf278e02650e76f71fc81deb15a9b202e4c1abcc
+# Must be independently rebuilt and reviewed after private-prefix changes.
+binary_sha=UNREVIEWED_BUILD
 case "$binary:$archive:$parent" in /*:/*:/*) ;; *) exit 2;; esac
 case "$binary_sha" in *[!0-9a-f]*|'') exit 2;; esac
 [ "${#binary_sha}" -eq 64 ] || exit 2
@@ -26,8 +25,8 @@ printf '[storage]\ndriver = "vfs"\n' > "$base/config/storage.conf"
 image=sha256:9779a4143ae4607c8702ee40a94ae02c0c7b759c567588b4ef95a07d3208e005
 # All subsequent commands use an empty environment and private state. Guest
 # interface checks do not attest host VM configuration or host isolation.
-run() { /usr/bin/env -i PATH="$base/bin:/usr/bin:/bin" HOME="$base/home" XDG_RUNTIME_DIR="$base/runtime" XDG_CONFIG_HOME="$base/config" TMPDIR="$base/tmp" CONTAINERS_CONF="$base/config/containers.conf" CONTAINERS_STORAGE_CONF="$base/config/storage.conf" QUAL_BASE="$base" QUAL_IMAGE="$image" QUAL_UID="$(id -u)" "$@"; }
-p() { run /usr/bin/podman --root "$base/root" --runroot "$base/runroot" --tmpdir "$base/tmp" --storage-driver vfs --events-backend none --hooks-dir "$base/hooks" "$@"; }
+run() { /usr/bin/env -i PATH="$base/bin:/opt/metaclaw-qualification/usr/bin:/usr/bin:/bin" LD_LIBRARY_PATH=/opt/metaclaw-qualification/usr/lib/x86_64-linux-gnu HOME="$base/home" XDG_RUNTIME_DIR="$base/runtime" XDG_CONFIG_HOME="$base/config" TMPDIR="$base/tmp" CONTAINERS_CONF="$base/config/containers.conf" CONTAINERS_STORAGE_CONF="$base/config/storage.conf" QUAL_BASE="$base" QUAL_IMAGE="$image" QUAL_UID="$(id -u)" "$@"; }
+p() { run /opt/metaclaw-qualification/usr/bin/podman --conmon /opt/metaclaw-qualification/usr/bin/conmon --runtime /opt/metaclaw-qualification/usr/bin/crun --root "$base/root" --runroot "$base/runroot" --tmpdir "$base/tmp" --storage-driver vfs --events-backend none --hooks-dir "$base/hooks" "$@"; }
 echo "qualification evidence retained: $base"
 # Preflight is in the compiled test binary, not a caller-provided attestation.
 run_one() {
@@ -53,7 +52,7 @@ marker=${3#metaclaw-intent-}
 [ "$3" = "metaclaw-intent-$marker" ] && [ "${#marker}" -eq 32 ] || exit 90
 case "$marker" in *[!0-9a-f]*|'') exit 90;; esac
 [ "$5" = "io.metaclaw.intent=$marker" ] || exit 90
-exec /usr/bin/podman --root "$QUAL_BASE/root" --runroot "$QUAL_BASE/runroot" --tmpdir "$QUAL_BASE/tmp" --storage-driver vfs --events-backend none --hooks-dir "$QUAL_BASE/hooks" create --pull=never --image-volume=ignore "$2" "$3" "$4" "$5" "$6" "$7"
+exec /opt/metaclaw-qualification/usr/bin/podman --conmon /opt/metaclaw-qualification/usr/bin/conmon --runtime /opt/metaclaw-qualification/usr/bin/crun --root "$QUAL_BASE/root" --runroot "$QUAL_BASE/runroot" --tmpdir "$QUAL_BASE/tmp" --storage-driver vfs --events-backend none --hooks-dir "$QUAL_BASE/hooks" create --pull=never --image-volume=ignore "$2" "$3" "$4" "$5" "$6" "$7"
 WRAPPER
 chmod 700 "$base/bin/podman"
 run_one TestGuestIntentRefusesOwner 90s
